@@ -1,6 +1,7 @@
 # /etc/filebeat/filebeat.yml
 # ====================== Filebeat Inputs ======================
 filebeat.inputs:
+  # Regular Laravel logs
   - type: log
     enabled: true
     paths:
@@ -8,10 +9,29 @@ filebeat.inputs:
     fields:
       app: laravel
       env: production
+      log_type: general
     fields_under_root: true
     multiline.pattern: '^\['
     multiline.negate: true
     multiline.match: after
+    # Exclude sensitive logs từ general log
+    exclude_lines: ['laravel\.ALERT: Sensitive Info Alert']
+
+  # Sensitive logs - riêng biệt
+  - type: log
+    enabled: true
+    paths:
+      - /var/www/html/myapp/storage/logs/sensitive.log
+    fields:
+      app: laravel
+      env: production
+      log_type: sensitive
+    fields_under_root: true
+    multiline.pattern: '^\['
+    multiline.negate: true
+    multiline.match: after
+    # Chỉ lấy sensitive logs
+    include_lines: ['laravel\.ALERT: Sensitive Info Alert']
 
 # ====================== Filebeat Modules ======================
 # (Tắt tất cả module mặc định)
@@ -19,13 +39,55 @@ filebeat.config.modules:
   path: ${path.config}/modules.d/*.yml
   reload.enabled: false
 
+# ====================== Processors ======================
+processors:
+  # Thêm timestamp processing
+  - timestamp:
+      field: "@timestamp"
+      layouts:
+        - '2006-01-02T15:04:05.999Z'
+        - '2006-01-02T15:04:05.999-07:00'
+      test:
+        - '2025-10-18T10:35:04.123Z'
+
+  # Drop các field không cần thiết để giảm data size
+  - drop_fields:
+      fields: ["ecs", "host.architecture", "host.os.family"]
+      ignore_missing: true
+
+  # Thêm metadata cho sensitive logs
+  - add_fields:
+      when:
+        equals:
+          log_type: "sensitive"
+      fields:
+        data_classification: "confidential"
+        compliance_required: true
+        retention_days: 30
+      target: metadata
+
 # ====================== Elasticsearch output (tắt) ======================
 # output.elasticsearch:
 #  hosts: ["localhost:9200"]
 
 # ====================== Logstash output ======================
 output.logstash:
-  hosts: ["localhost:5044"]
+  hosts: ["localhost:5044", "localhost:5045"]
+  loadbalance: false
+  worker: 1
+  
+  # Conditional routing dựa trên log_type
+  # General logs → port 5044 (laravel.conf)
+  # Sensitive logs → port 5045 (sensitive.conf)
+  when:
+    - equals:
+        log_type: "sensitive"
+      then:
+        hosts: ["localhost:5045"]
+    - equals:
+        log_type: "general"
+      then:
+        hosts: ["localhost:5044"]
 
 # ====================== Logging ======================
 logging.level: info
@@ -35,3 +97,25 @@ logging.files:
   name: filebeat
   keepfiles: 7
   permissions: 0644
+
+# ====================== Monitoring ======================
+monitoring:
+  enabled: true
+  elasticsearch:
+    hosts: ["localhost:9200"]
+    index: "filebeat-monitoring"
+  
+# ====================== Queue Settings ======================
+queue.mem:
+  events: 4096
+  flush.min_events: 512
+  flush.timeout: 1s
+
+# ====================== Additional Settings ======================
+# Tăng hiệu suất cho sensitive logs
+filebeat.registry.path: /var/lib/filebeat/registry
+filebeat.registry.file_permissions: 0600
+filebeat.registry.flush: 1s
+
+# Security settings
+filebeat.strict.perms: true
